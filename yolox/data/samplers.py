@@ -83,3 +83,54 @@ class InfiniteSampler(Sampler):
 
     def __len__(self):
         return self._size // self._world_size
+
+
+class WeightedInfiniteSampler(Sampler):
+    """An infinite, replacement sampler with per-index sampling weights.
+
+    Every DDP rank consumes a disjoint stride of one deterministic global
+    stream.  As with :class:`InfiniteSampler`, this keeps ranks in sync while
+    retaining the usual replacement semantics (the same image can occur more
+    than once in an epoch).
+    """
+
+    def __init__(self, weights, seed: Optional[int] = 0, rank=0, world_size=1):
+        self._weights = torch.as_tensor(weights, dtype=torch.double, device="cpu")
+        if self._weights.ndim != 1 or self._weights.numel() == 0:
+            raise ValueError("weights must be a non-empty one-dimensional sequence")
+        if not torch.isfinite(self._weights).all() or (self._weights < 0).any():
+            raise ValueError("weights must be finite and greater than or equal to zero")
+        if self._weights.sum().item() <= 0:
+            raise ValueError("the sum of weights must be greater than zero")
+
+        self._size = self._weights.numel()
+        self._seed = int(seed or 0)
+        if dist.is_available() and dist.is_initialized():
+            self._rank = dist.get_rank()
+            self._world_size = dist.get_world_size()
+        else:
+            self._rank = rank
+            self._world_size = world_size
+        if not 0 <= self._rank < self._world_size:
+            raise ValueError("rank must be in [0, world_size)")
+
+    def __iter__(self):
+        yield from itertools.islice(
+            self._infinite_indices(), self._rank, None, self._world_size
+        )
+
+    def _infinite_indices(self):
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(self._seed)
+        # Drawing modest chunks avoids per-index torch calls without retaining
+        # an epoch-sized index list.  This is deliberately CPU-only.
+        while True:
+            yield from torch.multinomial(
+                self._weights,
+                num_samples=1024,
+                replacement=True,
+                generator=generator,
+            ).tolist()
+
+    def __len__(self):
+        return self._size // self._world_size
