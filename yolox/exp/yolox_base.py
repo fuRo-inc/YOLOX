@@ -93,6 +93,17 @@ class Exp(BaseExp):
         # eval period in epoch, for example,
         # if set to 1, model will be evaluate after every epoch.
         self.eval_interval = 10
+        # Opt-in only. Custom experiments provide the per-domain image/annotation
+        # names; ordinary YOLOX experiments retain their existing single evaluator.
+        self.domain_weighted_validation = False
+        self.validation_domain_weights = None
+        self.validation_domain_specs = {
+            "coco": {"images": "val_coco", "annotations": "instances_val_coco2017.json"},
+            "day": {"images": "val_day", "annotations": "instances_val_day_filtered_day_5000.json"},
+            "night": {"images": "val_night", "annotations": "instances_val_night.json"},
+            "twilight": {"images": "val_twilight", "annotations": "instances_val_twilight.json"},
+            "mori": {"images": "val_mori", "annotations": "instances_val_mori.json"},
+        }
         # save history checkpoint or not.
         # If set to False, yolox will only save latest and best ckpt.
         self.save_history_ckpt = True
@@ -342,6 +353,53 @@ class Exp(BaseExp):
             num_classes=self.num_classes,
             testdev=testdev,
         )
+
+    def get_domain_evaluators(self, batch_size, is_distributed):
+        """Build deterministic, full-dataset validation loaders per configured domain."""
+        from yolox.data import COCODataset, ValTransform
+        from yolox.evaluators import COCOEvaluator
+        from yolox.utils.domain_validation import VALIDATION_DOMAINS, validate_domain_weights
+
+        if not self.domain_weighted_validation:
+            return {}, {}
+        if self.validation_domain_weights is None or self.validation_domain_specs is None:
+            raise ValueError("domain_weighted_validation requires weights and domain specs")
+        weights = validate_domain_weights(self.validation_domain_weights, VALIDATION_DOMAINS)
+        if set(self.validation_domain_specs) != set(VALIDATION_DOMAINS):
+            raise ValueError("validation_domain_specs must define coco/day/night/twilight/mori exactly")
+
+        per_rank_batch_size = batch_size // dist.get_world_size() if is_distributed else batch_size
+        evaluators, image_counts = {}, {}
+        for domain in VALIDATION_DOMAINS:
+            spec = self.validation_domain_specs[domain]
+            dataset = COCODataset(
+                data_dir=self.data_dir,
+                json_file=spec["annotations"],
+                name=spec["images"],
+                img_size=self.test_size,
+                preproc=ValTransform(legacy=False),
+            )
+            image_counts[domain] = len(dataset)
+            if image_counts[domain] == 0 and weights[domain] > 0:
+                raise ValueError(f"Validation domain {domain!r} has zero images but weight is {weights[domain]}")
+            if image_counts[domain] == 0:
+                # A zero-weight empty domain is valid. There is no metric to
+                # evaluate, and its placeholder cannot affect aggregation.
+                evaluators[domain] = None
+                continue
+            sampler = (
+                torch.utils.data.distributed.DistributedSampler(dataset, shuffle=False)
+                if is_distributed else torch.utils.data.SequentialSampler(dataset)
+            )
+            loader = torch.utils.data.DataLoader(
+                dataset, num_workers=self.data_num_workers, pin_memory=True,
+                sampler=sampler, batch_size=per_rank_batch_size,
+            )
+            evaluators[domain] = COCOEvaluator(
+                dataloader=loader, img_size=self.test_size, confthre=self.test_conf,
+                nmsthre=self.nmsthre, num_classes=self.num_classes,
+            )
+        return evaluators, image_counts
 
     def get_trainer(self, args):
         from yolox.core import Trainer

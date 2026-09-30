@@ -7,6 +7,7 @@ import time
 from loguru import logger
 
 import torch
+import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
@@ -31,6 +32,11 @@ from yolox.utils import (
     save_checkpoint,
     setup_logger,
     synchronize
+)
+from yolox.utils.domain_validation import (
+    VALIDATION_DOMAINS,
+    aggregate_domain_values,
+    select_validation_value,
 )
 
 
@@ -175,6 +181,9 @@ class Trainer:
         self.model = model
 
         self.evaluator = self.exp.get_evaluator(
+            batch_size=self.args.batch_size, is_distributed=self.is_distributed
+        )
+        self.domain_evaluators, self.domain_validation_image_counts = self.exp.get_domain_evaluators(
             batch_size=self.args.batch_size, is_distributed=self.is_distributed
         )
         # Tensorboard and Wandb loggers
@@ -356,34 +365,86 @@ class Trainer:
                 evalmodel, self.evaluator, self.is_distributed, return_outputs=True
             )
 
-        update_best_ckpt = ap50_95 > self.best_ap
-        self.best_ap = max(self.best_ap, ap50_95)
+            domain_ap50_95 = {}
+            if self.domain_evaluators:
+                for domain, evaluator in self.domain_evaluators.items():
+                    if evaluator is None:
+                        domain_ap50_95[domain] = 0.0
+                    else:
+                        domain_ap50_95[domain], _, _ = self.exp.eval(
+                            evalmodel, evaluator, self.is_distributed, return_outputs=False
+                        )
+                weighted_ap50_95 = aggregate_domain_values(
+                    domain_ap50_95,
+                    self.exp.validation_domain_weights,
+                    self.domain_validation_image_counts,
+                    VALIDATION_DOMAINS,
+                )
+                # COCOEvaluator returns metric values only on rank zero. Broadcast
+                # the aggregate so DDP ranks retain identical best-value state.
+                if self.is_distributed:
+                    weighted_tensor = torch.tensor([weighted_ap50_95], device=self.device)
+                    dist.broadcast(weighted_tensor, src=0)
+                    weighted_ap50_95 = weighted_tensor.item()
+            else:
+                weighted_ap50_95 = ap50_95
+
+        selection_ap = select_validation_value(
+            ap50_95, weighted_ap50_95, bool(getattr(self.exp, "domain_weighted_validation", False))
+        )
+        update_best_ckpt = selection_ap > self.best_ap
+        self.best_ap = max(self.best_ap, selection_ap)
 
         if self.rank == 0:
             if self.args.logger == "tensorboard":
                 self.tblogger.add_scalar("val/COCOAP50", ap50, self.epoch + 1)
                 self.tblogger.add_scalar("val/COCOAP50_95", ap50_95, self.epoch + 1)
+                self.tblogger.add_scalar("val/raw_AP50_95", ap50_95, self.epoch + 1)
+                if self.domain_evaluators:
+                    self.tblogger.add_scalar("val/domain_weighted_AP50_95", weighted_ap50_95, self.epoch + 1)
+                    for domain, value in domain_ap50_95.items():
+                        self.tblogger.add_scalar(f"val/{domain}/AP50_95", value, self.epoch + 1)
             if self.args.logger == "wandb":
-                self.wandb_logger.log_metrics({
+                wandb_metrics = {
                     "val/COCOAP50": ap50,
                     "val/COCOAP50_95": ap50_95,
+                    "val/raw_AP50_95": ap50_95,
                     "train/epoch": self.epoch + 1,
-                })
+                }
+                if self.domain_evaluators:
+                    wandb_metrics["val/domain_weighted_AP50_95"] = weighted_ap50_95
+                    wandb_metrics.update({f"val/{domain}/AP50_95": value for domain, value in domain_ap50_95.items()})
+                self.wandb_logger.log_metrics(wandb_metrics)
                 self.wandb_logger.log_images(predictions)
             if self.args.logger == "mlflow":
                 logs = {
                     "val/COCOAP50": ap50,
                     "val/COCOAP50_95": ap50_95,
+                    "val/raw_AP50_95": ap50_95,
                     "val/best_ap": round(self.best_ap, 3),
                     "train/epoch": self.epoch + 1,
                 }
+                if self.domain_evaluators:
+                    logs["val/domain_weighted_AP50_95"] = weighted_ap50_95
+                    logs.update({f"val/{domain}/AP50_95": value for domain, value in domain_ap50_95.items()})
                 self.mlflow_logger.on_log(self.args, self.exp, self.epoch+1, logs)
             logger.info("\n" + summary)
+            if self.domain_evaluators:
+                logger.info("=" * 60 + "\nDomain validation AP50:95 - epoch {}".format(self.epoch + 1))
+                logger.info("{:<10} {:>8} {:>10} {:>12}".format("Domain", "Images", "Weight", "AP50:95"))
+                for domain in VALIDATION_DOMAINS:
+                    logger.info("{:<10} {:>8} {:>10.4f} {:>12.6f}".format(
+                        domain, self.domain_validation_image_counts[domain],
+                        self.exp.validation_domain_weights[domain], domain_ap50_95[domain],
+                    ))
+                logger.info("raw validation AP50:95             : {:.6f}".format(ap50_95))
+                logger.info("domain weighted validation AP50:95 : {:.6f}".format(weighted_ap50_95))
+                logger.info("best checkpoint selection AP50:95  : {:.6f}".format(selection_ap))
         synchronize()
 
-        self.save_ckpt("last_epoch", update_best_ckpt, ap=ap50_95)
+        self.save_ckpt("last_epoch", update_best_ckpt, ap=selection_ap)
         if self.save_history_ckpt:
-            self.save_ckpt(f"epoch_{self.epoch + 1}", ap=ap50_95)
+            self.save_ckpt(f"epoch_{self.epoch + 1}", ap=selection_ap)
 
         if self.args.logger == "mlflow":
             metadata = {
